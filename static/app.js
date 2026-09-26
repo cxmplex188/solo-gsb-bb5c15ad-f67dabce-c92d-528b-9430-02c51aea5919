@@ -199,6 +199,35 @@ const clockRecordsEl = $("clock-records");
 const clockEl = $("clock-result");
 const toleranceEl = $("tolerance-result");
 
+// 面板级请求守卫：每次提交开启新代次并记录当时的输入快照；
+// 相关输入变更（手动编辑、清空或程序化填入）会使在途请求失效，
+// 响应返回时仅当“仍是最新代次且当前输入快照未变”才允许渲染，过期响应一律丢弃。
+function createRequestGuard(getSnapshot) {
+  let generation = 0;
+  return {
+    begin() {
+      generation += 1;
+      return { generation, snapshot: getSnapshot() };
+    },
+    invalidate() {
+      generation += 1;
+    },
+    isCurrent(token) {
+      return token.generation === generation && token.snapshot === getSnapshot();
+    },
+  };
+}
+
+// 有序事件最大统一间隔与全局容差评估两个面板各自的请求守卫（代次 + 输入快照），
+// 互不干扰：最大间隔面板快照为“区间文本 + 顺序文本”，容差面板快照为区间文本。
+// 手动编辑经 input 监听显式失效；程序化填入/清空改变输入值后，
+// 响应返回时的快照比对同样会判旧响应过期，不会把旧输入的结论写回页面。
+const maxgapGuard = createRequestGuard(() => JSON.stringify({
+  text: inputEl.value,
+  order: maxgapOrderEl.value,
+}));
+const toleranceGuard = createRequestGuard(() => inputEl.value);
+
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -782,6 +811,8 @@ $("btn-clear").addEventListener("click", () => {
   maxgapEl.innerHTML = "";
   clockEl.innerHTML = "";
   toleranceEl.innerHTML = "";
+  maxgapGuard.invalidate();    // 区间已清空：在途的最大统一间隔请求失效
+  toleranceGuard.invalidate(); // 区间已清空：在途的全局容差请求失效
   refreshLineOptions();
   inputEl.focus();
 });
@@ -795,8 +826,10 @@ inputEl.addEventListener("input", () => {
   withdrawEl.innerHTML = "";    // 文本已变，旧的最少撤回结论作废
   aliasEl.innerHTML = "";       // 区间已变，旧的别名归并结论作废
   itineraryEl.innerHTML = "";   // 区间已变，旧的行程可达性结论作废
+  maxgapGuard.invalidate();     // 区间已变：在途的最大统一间隔请求失效
   maxgapEl.innerHTML = "";      // 区间已变，旧的最大统一间隔结论作废
   clockEl.innerHTML = "";       // 区间已变，旧的时钟对齐结论作废
+  toleranceGuard.invalidate();  // 区间已变：在途的全局容差请求失效
   toleranceEl.innerHTML = "";   // 区间已变，旧的全局容差结论作废
 });
 refreshLineOptions();
@@ -1962,6 +1995,7 @@ function renderMaxgapIntervalConflict(data) {
 }
 
 async function queryMaxgap() {
+  const token = maxgapGuard.begin();  // 记录本请求的代次与输入快照（区间文本 + 顺序文本）
   maxgapEl.innerHTML = `<div class="card muted">联立求最大统一间隔中…</div>`;
   try {
     const resp = await fetch("/api/max-gap", {
@@ -1970,12 +2004,14 @@ async function queryMaxgap() {
       body: JSON.stringify({ text: inputEl.value, order: maxgapOrderEl.value }),
     });
     const data = await resp.json();
+    if (!maxgapGuard.isCurrent(token)) return;  // 输入已变或已有更新的请求：丢弃过期响应
     if (data.status === "ok") renderMaxgapOk(data);
     else if (data.status === "unbounded") renderMaxgapUnbounded(data);
     else if (data.status === "order_conflict") renderMaxgapOrderConflict(data);
     else if (data.status === "interval_conflict") renderMaxgapIntervalConflict(data);
     else renderErrors(data.errors || [{ line: null, message: "未知错误。" }], maxgapEl);
   } catch (err) {
+    if (!maxgapGuard.isCurrent(token)) return;  // 过期请求的网络错误同样不渲染
     maxgapEl.innerHTML = `
       <div class="banner err"><h2>请求失败</h2><p>${esc(err.message)}</p></div>`;
   }
@@ -2002,11 +2038,13 @@ $("btn-maxgap-example-conflict").addEventListener("click", () => {
 });
 $("btn-maxgap-clear").addEventListener("click", () => {
   maxgapOrderEl.value = "";
+  maxgapGuard.invalidate();  // 顺序已清空：在途的最大统一间隔请求失效
   maxgapEl.innerHTML = "";
   maxgapOrderEl.focus();
 });
 maxgapOrderEl.addEventListener("input", () => {
-  maxgapEl.innerHTML = "";  // 顺序已变，旧的最大统一间隔结论作废
+  maxgapGuard.invalidate();   // 顺序已变：在途的最大统一间隔请求失效
+  maxgapEl.innerHTML = "";    // 顺序已变，旧的最大统一间隔结论作废
 });
 
 // ---------- 记录时钟对齐 ----------
@@ -2318,6 +2356,7 @@ function renderTolerance(data) {
 }
 
 async function evaluateTolerance() {
+  const token = toleranceGuard.begin();  // 记录本请求的代次与输入快照（区间文本）
   toleranceEl.innerHTML = `<div class="card muted">求最小统一容差中…</div>`;
   try {
     const resp = await fetch("/api/tolerance", {
@@ -2326,9 +2365,11 @@ async function evaluateTolerance() {
       body: JSON.stringify({ text: inputEl.value }),
     });
     const data = await resp.json();
+    if (!toleranceGuard.isCurrent(token)) return;  // 输入已变或已有更新的请求：丢弃过期响应
     if (data.status === "ok") renderTolerance(data);
     else renderErrors(data.errors || [{ line: null, message: "未知错误。" }], toleranceEl);
   } catch (err) {
+    if (!toleranceGuard.isCurrent(token)) return;  // 过期请求的网络错误同样不渲染
     toleranceEl.innerHTML = `
       <div class="banner err"><h2>请求失败</h2><p>${esc(err.message)}</p></div>`;
   }
